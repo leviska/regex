@@ -268,6 +268,64 @@ mod inner {
     /// do.
     static THREAD_ID_DROPPED: usize = 2;
 
+    /// The number of stacks we use inside of the pool. These are only used for
+    /// non-owners. That is, these represent the "slow" path.
+    ///
+    /// In the original implementation of this pool, we only used a single
+    /// stack. While this might be okay for a couple threads, the prevalence of
+    /// 32, 64 and even 128 core CPUs has made it untenable. The contention
+    /// such an environment introduces when threads are doing a lot of searches
+    /// on short haystacks (a not uncommon use case) is palpable and leads to
+    /// huge slowdowns.
+    ///
+    /// This constant reflects a change from using one stack to the number of
+    /// stacks that this constant is set to. The stack for a particular thread
+    /// is simply chosen by `thread_id % MAX_POOL_STACKS`. The idea behind
+    /// this setup is that there should be a good chance that accesses to the
+    /// pool will be distributed over several stacks instead of all of them
+    /// converging to one.
+    ///
+    /// This is not a particular smart or dynamic strategy. Fixing this to a
+    /// specific number has at least two downsides. First is that it will help,
+    /// say, an 8 core CPU more than it will a 128 core CPU. (But, crucially,
+    /// it will still help the 128 core case.) Second is that this may wind
+    /// up being a little wasteful with respect to memory usage. Namely, if a
+    /// regex is used on one thread and then moved to another thread, then it
+    /// could result in creating a new copy of the data in the pool even though
+    /// one is actually needed.
+    ///
+    /// And that memory usage bit is why this is set to 8 and not, say, 64.
+    /// Keeping it at 8 limits, to an extent, how much unnecessary memory can
+    /// be allocated.
+    ///
+    /// In an ideal world, we'd be able to have something like this:
+    ///
+    /// * Grow the number of stacks as the number of concurrent callers
+    /// increases. I spent a little time trying this, but even just adding an
+    /// atomic addition/subtraction for each pop/push for tracking concurrent
+    /// callers led to a big perf hit. Since even more work would seemingly be
+    /// required than just an addition/subtraction, I abandoned this approach.
+    /// * The maximum amount of memory used should scale with respect to the
+    /// number of concurrent callers and *not* the total number of existing
+    /// threads. This is primarily why the `thread_local` crate isn't used, as
+    /// as some environments spin up a lot of threads. This led to multiple
+    /// reports of extremely high memory usage (often described as memory
+    /// leaks).
+    /// * Even more ideally, the pool could contract in size. That is, it
+    /// should grow with bursts and then shrink. But this is a pretty thorny
+    /// issue to tackle and it might be better to just not.
+    /// * It would be nice to explore the use of, say, a lock-free stack
+    /// instead of using a mutex to guard a `Vec` that is ultimately just
+    /// treated as a stack. The main thing preventing me from exploring this
+    /// is the ABA problem. The `crossbeam` crate has tools for dealing with
+    /// this sort of problem (via its epoch based memory reclamation strategy),
+    /// but I can't justify bringing in all of `crossbeam` as a dependency of
+    /// `regex` for this.
+    ///
+    /// See this issue for more context and discussion:
+    /// https://github.com/rust-lang/regex/issues/934
+    const MAX_POOL_STACKS: usize = 8;
+
     thread_local!(
         /// A thread local used to assign an ID to a thread.
         static THREAD_ID: usize = {
@@ -299,12 +357,12 @@ mod inner {
     /// This makes the common case of running a regex within a single thread
     /// faster by avoiding mutex unlocking.
     pub(super) struct Pool<T, F> {
-        /// A stack of T values to hand out. These are used when a Pool is
-        /// accessed by a thread that didn't create it.
-        stack: Mutex<Vec<Box<T>>>,
         /// A function to create more T values when stack is empty and a caller
         /// has requested a T.
         create: F,
+        /// A stack of T values to hand out. These are used when a Pool is
+        /// accessed by a thread that didn't create it.
+        stacks: Vec<Mutex<Vec<Box<T>>>>,
         /// The ID of the thread that owns this pool. The owner is the thread
         /// that makes the first call to 'get'. When the owner calls 'get', it
         /// gets 'owner_val' directly instead of returning a T from 'stack'.
@@ -375,9 +433,13 @@ mod inner {
             // 'Pool::new' method as 'const' too. (The alloc-only Pool::new
             // is already 'const', so that should "just work" too.) The only
             // thing we're waiting for is Mutex::new to be const.
+            let mut stacks = Vec::with_capacity(MAX_POOL_STACKS);
+            for _ in 0..MAX_POOL_STACKS {
+                stacks.push(Mutex::new(vec![]));
+            }
             let owner = AtomicUsize::new(THREAD_ID_UNOWNED);
             let owner_val = UnsafeCell::new(None); // init'd on first access
-            Pool { stack: Mutex::new(vec![]), create, owner, owner_val }
+            Pool { create, stacks, owner, owner_val }
         }
     }
 
@@ -401,6 +463,9 @@ mod inner {
             let caller = THREAD_ID.with(|id| *id);
             let owner = self.owner.load(Ordering::Acquire);
             if caller == owner {
+                // N.B. We could also do a CAS here instead of a load/store,
+                // but ad hoc benchmarking suggests it is slower. And a lot
+                // slower in the case where `get_slow` is common.
                 self.owner.store(THREAD_ID_INUSE, Ordering::Release);
                 return self.guard_owned(caller);
             }
@@ -444,7 +509,8 @@ mod inner {
                     return self.guard_owned(caller);
                 }
             }
-            let mut stack = self.stack.lock().unwrap();
+            let stack_id = caller % MAX_POOL_STACKS;
+            let mut stack = self.stacks[stack_id].lock().unwrap();
             let value = match stack.pop() {
                 None => Box::new((self.create)()),
                 Some(value) => value,
@@ -456,7 +522,9 @@ mod inner {
         /// Once the guard that's returned by 'get' is dropped, it is put back
         /// into the pool automatically.
         fn put_value(&self, value: Box<T>) {
-            let mut stack = self.stack.lock().unwrap();
+            let caller = THREAD_ID.with(|id| *id);
+            let stack_id = caller % MAX_POOL_STACKS;
+            let mut stack = self.stacks[stack_id].lock().unwrap();
             stack.push(value);
         }
 
@@ -474,7 +542,7 @@ mod inner {
     impl<T: core::fmt::Debug, F> core::fmt::Debug for Pool<T, F> {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             f.debug_struct("Pool")
-                .field("stack", &self.stack)
+                .field("stacks", &self.stacks)
                 .field("owner", &self.owner)
                 .field("owner_val", &self.owner_val)
                 .finish()
