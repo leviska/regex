@@ -232,12 +232,15 @@ mod inner {
     use core::{
         cell::UnsafeCell,
         panic::{RefUnwindSafe, UnwindSafe},
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use alloc::{boxed::Box, vec, vec::Vec};
 
-    use std::{sync::Mutex, thread_local};
+    use std::{
+        sync::{Mutex, MutexGuard},
+        thread_local,
+    };
 
     /// An atomic counter used to allocate thread IDs.
     ///
@@ -349,6 +352,70 @@ mod inner {
         };
     );
 
+    #[derive(Debug)]
+    struct TryMutex<T> {
+        data: UnsafeCell<T>,
+        used: AtomicBool,
+    }
+
+    unsafe impl<T: Sync> Sync for TryMutex<T> {}
+
+    #[derive(Debug)]
+    struct TryMutexGuard<'a, T> {
+        lock: &'a TryMutex<T>,
+    }
+
+    unsafe impl<'a, T: Sync> Sync for TryMutexGuard<'a, T> {}
+
+    impl<'a, T> Drop for TryMutexGuard<'a, T> {
+        fn drop(&mut self) {
+            self.lock
+                .used
+                .compare_exchange(
+                    true,
+                    false,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .unwrap();
+        }
+    }
+
+    impl<'a, T> TryMutexGuard<'a, T> {
+        fn get(&self) -> &T {
+            let data = self.lock.data.get();
+            unsafe { &*data }
+        }
+
+        fn get_mut(&mut self) -> &mut T {
+            let data = self.lock.data.get();
+            unsafe { &mut *data }
+        }
+    }
+
+    impl<T> TryMutex<T> {
+        fn new(t: T) -> TryMutex<T> {
+            TryMutex { data: UnsafeCell::new(t), used: AtomicBool::new(false) }
+        }
+
+        fn try_get(&self) -> Option<TryMutexGuard<'_, T>> {
+            if self
+                .used
+                .compare_exchange(
+                    false,
+                    true,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                Some(TryMutexGuard { lock: self })
+            } else {
+                None
+            }
+        }
+    }
+
     /// A thread safe pool utilizing std-only features.
     ///
     /// The main difference between this and the simplistic alloc-only pool is
@@ -362,6 +429,8 @@ mod inner {
         create: F,
         /// A stack of T values to hand out. These are used when a Pool is
         /// accessed by a thread that didn't create it.
+        fast_stack: Vec<TryMutex<Option<Box<T>>>>,
+        allocated: AtomicUsize,
         stacks: Vec<Mutex<Vec<Box<T>>>>,
         /// The ID of the thread that owns this pool. The owner is the thread
         /// that makes the first call to 'get'. When the owner calls 'get', it
@@ -433,13 +502,26 @@ mod inner {
             // 'Pool::new' method as 'const' too. (The alloc-only Pool::new
             // is already 'const', so that should "just work" too.) The only
             // thing we're waiting for is Mutex::new to be const.
+            let fast_stack_size =
+                std::thread::available_parallelism().unwrap().into();
+            let mut fast_stack = Vec::with_capacity(fast_stack_size);
+            for _ in 0..fast_stack_size {
+                fast_stack.push(TryMutex::new(None))
+            }
             let mut stacks = Vec::with_capacity(MAX_POOL_STACKS);
             for _ in 0..MAX_POOL_STACKS {
                 stacks.push(Mutex::new(vec![]));
             }
             let owner = AtomicUsize::new(THREAD_ID_UNOWNED);
             let owner_val = UnsafeCell::new(None); // init'd on first access
-            Pool { create, stacks, owner, owner_val }
+            Pool {
+                create,
+                fast_stack,
+                allocated: AtomicUsize::new(0),
+                stacks,
+                owner,
+                owner_val,
+            }
         }
     }
 
@@ -509,6 +591,27 @@ mod inner {
                     return self.guard_owned(caller);
                 }
             }
+
+            let allocated = self.allocated.load(Ordering::SeqCst);
+            for shift in 0..allocated {
+                let i = (caller + shift) % allocated;
+                if let Some(guard) = self.fast_stack[i].try_get() {
+                    if guard.get().is_some() {
+                        return self.guard_mutex(guard);
+                    }
+                }
+            }
+            for i in 0..self.fast_stack.len() {
+                if let Some(mut guard) = self.fast_stack[i].try_get() {
+                    let value = guard.get_mut();
+                    if let None = value {
+                        self.allocated.fetch_add(1, Ordering::SeqCst);
+                        *value = Some(Box::new((self.create)()));
+                    }
+                    return self.guard_mutex(guard);
+                }
+            }
+
             let stack_id = caller % MAX_POOL_STACKS;
             let mut stack = self.stacks[stack_id].lock().unwrap();
             let value = match stack.pop() {
@@ -535,7 +638,15 @@ mod inner {
 
         /// Create a guard that contains a value from the pool's stack.
         fn guard_stack(&self, value: Box<T>) -> PoolGuard<'_, T, F> {
-            PoolGuard { pool: self, value: Ok(value) }
+            PoolGuard { pool: self, value: Ok(PoolGuardValue::Stack(value)) }
+        }
+
+        /// Create a guard that contains a value from the pool's stack.
+        fn guard_mutex<'a>(
+            &'a self,
+            value: TryMutexGuard<'a, Option<Box<T>>>,
+        ) -> PoolGuard<'a, T, F> {
+            PoolGuard { pool: self, value: Ok(PoolGuardValue::Mutex(value)) }
         }
     }
 
@@ -549,6 +660,12 @@ mod inner {
         }
     }
 
+    #[derive(Debug)]
+    enum PoolGuardValue<'a, T> {
+        Stack(Box<T>),
+        Mutex(TryMutexGuard<'a, Option<Box<T>>>),
+    }
+
     /// A guard that is returned when a caller requests a value from the pool.
     pub(super) struct PoolGuard<'a, T: Send, F: Fn() -> T> {
         /// The pool that this guard is attached to.
@@ -557,14 +674,17 @@ mod inner {
         /// In which case, the value is retrieved from 'pool.owner_val'. And
         /// in the special case of `Err(THREAD_ID_DROPPED)`, it means the
         /// guard has been put back into the pool and should no longer be used.
-        value: Result<Box<T>, usize>,
+        value: Result<PoolGuardValue<'a, T>, usize>,
     }
 
     impl<'a, T: Send, F: Fn() -> T> PoolGuard<'a, T, F> {
         /// Return the underlying value.
         pub(super) fn value(&self) -> &T {
             match self.value {
-                Ok(ref v) => &**v,
+                Ok(ref v) => match v {
+                    PoolGuardValue::Stack(ref v) => &**v,
+                    PoolGuardValue::Mutex(ref v) => v.get().as_ref().unwrap(),
+                },
                 // SAFETY: This is safe because the only way a PoolGuard gets
                 // created for self.value=Err is when the current thread
                 // corresponds to the owning thread, of which there can only
@@ -588,7 +708,12 @@ mod inner {
         /// Return the underlying value as a mutable borrow.
         pub(super) fn value_mut(&mut self) -> &mut T {
             match self.value {
-                Ok(ref mut v) => &mut **v,
+                Ok(ref mut v) => match v {
+                    PoolGuardValue::Stack(ref mut v) => &mut **v,
+                    PoolGuardValue::Mutex(ref mut v) => {
+                        v.get_mut().as_mut().unwrap()
+                    }
+                },
                 // SAFETY: This is safe because the only way a PoolGuard gets
                 // created for self.value=None is when the current thread
                 // corresponds to the owning thread, of which there can only
@@ -625,7 +750,10 @@ mod inner {
         #[inline(always)]
         fn put_imp(&mut self) {
             match core::mem::replace(&mut self.value, Err(THREAD_ID_DROPPED)) {
-                Ok(value) => self.pool.put_value(value),
+                Ok(value) => match value {
+                    PoolGuardValue::Stack(value) => self.pool.put_value(value),
+                    PoolGuardValue::Mutex(_) => {}
+                },
                 // If this guard has a value "owned" by the thread, then
                 // the Pool guarantees that this is the ONLY such guard.
                 // Therefore, in order to place it back into the pool and make
