@@ -366,6 +366,7 @@ mod inner {
         /// A stack of T values to hand out. These are used when a Pool is
         /// accessed by a thread that didn't create it.
         stacks: Vec<Mutex<Option<Box<T>>>>,
+        allocated: AtomicUsize,
         /// The ID of the thread that owns this pool. The owner is the thread
         /// that makes the first call to 'get'. When the owner calls 'get', it
         /// gets 'owner_val' directly instead of returning a T from 'stack'.
@@ -443,7 +444,7 @@ mod inner {
             }
             let owner = AtomicUsize::new(THREAD_ID_UNOWNED);
             let owner_val = UnsafeCell::new(None); // init'd on first access
-            Pool { create, stacks, owner, owner_val }
+            Pool { create, stacks, owner, owner_val, allocated: AtomicUsize::new(0) }
         }
     }
 
@@ -514,8 +515,9 @@ mod inner {
                 }
             }
             let start = THREAD_ID.with(|id| *id);
-            for shift in 0..self.stacks.len() {
-                let i = (start + shift) % self.stacks.len();
+            let allocated = self.allocated.load(Ordering::SeqCst);
+            for shift in 0..allocated {
+                let i = (start + shift) % allocated;
                 if let Ok(value) = self.stacks[i].try_lock() {
                     if let Some(_) = *value {
                         return self.guard_stack(value);
@@ -527,6 +529,7 @@ mod inner {
                     if let Ok(mut value) = self.stacks[i].try_lock() {
                         if let None = *value {
                             *value = Some(Box::new((self.create)()));
+                            self.allocated.fetch_add(1, Ordering::SeqCst);
                         }
                         return self.guard_stack(value);
                     }
