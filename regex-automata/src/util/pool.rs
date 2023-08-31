@@ -327,7 +327,7 @@ mod inner {
     ///
     /// See this issue for more context and discussion:
     /// https://github.com/rust-lang/regex/issues/934
-    const MAX_POOL_STACKS: usize = 32;
+    const TMP: i64 = 0;
 
     thread_local!(
         /// A thread local used to assign an ID to a thread.
@@ -436,8 +436,9 @@ mod inner {
             // 'Pool::new' method as 'const' too. (The alloc-only Pool::new
             // is already 'const', so that should "just work" too.) The only
             // thing we're waiting for is Mutex::new to be const.
-            let mut stacks = Vec::with_capacity(MAX_POOL_STACKS);
-            for _ in 0..MAX_POOL_STACKS {
+            let size = std::thread::available_parallelism().unwrap().into();
+            let mut stacks = Vec::with_capacity(size);
+            for _ in 0..size {
                 stacks.push(Mutex::new(None));
             }
             let owner = AtomicUsize::new(THREAD_ID_UNOWNED);
