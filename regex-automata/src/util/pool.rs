@@ -596,12 +596,22 @@ mod inner {
             for shift in 0..allocated {
                 let i = (caller + shift) % allocated;
                 if let Some(guard) = self.fast_stack[i].try_get() {
+                    // actually we don't really need to check for "Some" here
+                    // because from invariant we should have only allocated objects here
+                    // 
+                    // this should never panic
+                    // guard.get().as_ref().unwrap();
                     if guard.get().is_some() {
                         return self.guard_mutex(guard);
                     }
                 }
             }
-            for i in 0..self.fast_stack.len() {
+
+            // starting from allocated is actually lil bit faster
+            // but we probably should heavily test that it's working correctly
+            //
+            // for i in allocated..self.fast_stack.len() {
+            for i in allocated..self.fast_stack.len() {
                 if let Some(mut guard) = self.fast_stack[i].try_get() {
                     let value = guard.get_mut();
                     if let None = value {
