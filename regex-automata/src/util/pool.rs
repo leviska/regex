@@ -611,7 +611,7 @@ mod inner {
             // but we probably should heavily test that it's working correctly
             //
             // for i in allocated..self.fast_stack.len() {
-            for i in allocated..self.fast_stack.len() {
+            for i in 0..self.fast_stack.len() {
                 if let Some(mut guard) = self.fast_stack[i].try_get() {
                     let value = guard.get_mut();
                     if let None = value {
