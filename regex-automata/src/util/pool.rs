@@ -514,9 +514,16 @@ mod inner {
                 }
             }
             let start = THREAD_ID.with(|id| *id);
+            for shift in 0..self.stacks.len() {
+                let i = (start + shift) % self.stacks.len();
+                if let Ok(value) = self.stacks[i].try_lock() {
+                    if let Some(_) = *value {
+                        return self.guard_stack(value);
+                    }
+                }
+            }
             loop {
-                for shift in 0..self.stacks.len() {
-                    let i = (start + shift) % self.stacks.len();
+                for i in 0..self.stacks.len() {
                     if let Ok(mut value) = self.stacks[i].try_lock() {
                         if let None = *value {
                             *value = Some(Box::new((self.create)()));
